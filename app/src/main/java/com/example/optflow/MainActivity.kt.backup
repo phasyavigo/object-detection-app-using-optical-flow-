@@ -1,0 +1,353 @@
+package com.example.optflow
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.util.Log
+import android.view.View
+import android.widget.ImageView
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.opencv.android.CameraBridgeViewBase
+import org.opencv.android.JavaCameraView
+import org.opencv.android.OpenCVLoader
+import org.opencv.core.*
+import org.opencv.imgproc.Imgproc
+import org.opencv.video.Video
+import java.util.*
+import kotlin.math.max
+import kotlin.math.min
+
+class MainActivity : AppCompatActivity(), CameraBridgeViewBase.CvCameraViewListener2 {
+
+    companion object {
+        private const val TAG = "OptFlow"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+
+        // Tuned parameters from Python script
+        private const val RESIZE_WIDTH = 480
+        private const val RESIZE_HEIGHT = 360
+        private const val THRESHOLD_HIGH = 2.0
+        private const val THRESHOLD_LOW = 1.4
+        private const val INTEGRATION_THRESHOLD = 15.0
+        private const val LOOMING_THRESHOLD = 0.3
+        private const val COOLDOWN_MS = 2000L
+        private const val ALPHA_SMOOTH = 0.5
+        private const val ALPHA_INTEGRATE = 0.88
+        private const val MIN_MAGNITUDE = 0.5
+        private const val DIRECTION_MARGIN = 0.4
+    }
+
+    private lateinit var cameraView: JavaCameraView
+    private lateinit var overlayCanvas: ImageView
+    private lateinit var statusText: TextView
+    private lateinit var metricsText: TextView
+    private lateinit var alertText: TextView
+
+    private var prevGray: Mat? = null
+    private var smoothMag = 0.0
+    private var temporalIntegrator = 0.0
+    private var detectedState = false
+    private var detectionMode = "NONE"
+    private var frameCount = 0
+    private var lastAlertTime = 0L
+
+    private val baselineSamples = LinkedList<Double>()
+    private val directionHistory = LinkedList<String>()
+    private var radialX: Mat? = null
+    private var radialY: Mat? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        cameraView = findViewById(R.id.cameraView)
+        overlayCanvas = findViewById(R.id.overlayCanvas)
+        statusText = findViewById(R.id.statusText)
+        metricsText = findViewById(R.id.metricsText)
+        alertText = findViewById(R.id.alertText)
+
+        cameraView.visibility = View.VISIBLE
+        cameraView.setCvCameraViewListener(this)
+
+        try {
+            cameraView.enableFpsMeter()
+        } catch (e: Exception) {
+            Log.d(TAG, "enableFpsMeter not available: ${e.message}")
+        }
+
+        if (allPermissionsGranted()) {
+            initOpenCVAndStart()
+        } else {
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+        }
+    }
+
+    private fun allPermissionsGranted() =
+        REQUIRED_PERMISSIONS.all {
+            ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+        }
+
+    @Suppress("DEPRECATION")
+    private fun initOpenCVAndStart() {
+        val ok = OpenCVLoader.initDebug()
+        if (!ok) {
+            Log.e(TAG, "OpenCV init failed")
+        } else {
+            Log.d(TAG, "OpenCV init OK")
+            cameraView.setCameraPermissionGranted()
+            cameraView.enableView()
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                initOpenCVAndStart()
+            } else {
+                Log.e(TAG, "Camera permission denied")
+                finish()
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (::cameraView.isInitialized) cameraView.disableView()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        @Suppress("DEPRECATION")
+        if (OpenCVLoader.initDebug()) {
+            cameraView.enableView()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (::cameraView.isInitialized) cameraView.disableView()
+        prevGray?.release()
+        radialX?.release()
+        radialY?.release()
+    }
+
+    override fun onCameraViewStarted(width: Int, height: Int) {
+        prevGray = null
+        precomputeRadialGrid(Size(RESIZE_WIDTH.toDouble(), RESIZE_HEIGHT.toDouble()))
+    }
+
+    override fun onCameraViewStopped() {
+        prevGray?.release()
+        prevGray = null
+    }
+
+    override fun onCameraFrame(inputFrame: CameraBridgeViewBase.CvCameraViewFrame?): Mat {
+        val rgba = inputFrame?.rgba() ?: return Mat()
+        val gray = inputFrame.gray()
+
+        // Create a smaller grayscale mat for performance-critical processing
+        val smallGray = Mat()
+        val processingSize = Size(RESIZE_WIDTH.toDouble(), RESIZE_HEIGHT.toDouble())
+        Imgproc.resize(gray, smallGray, processingSize)
+
+        try {
+            frameCount++
+            if (prevGray == null) {
+                prevGray = smallGray.clone()
+                return rgba // Return original, unmodified frame
+            }
+
+            // --- All calculations are done on the small grayscale frame ---
+            val flow = Mat()
+            Video.calcOpticalFlowFarneback(prevGray, smallGray, flow, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+            val flowSplit = ArrayList<Mat>()
+            Core.split(flow, flowSplit)
+            val u = flowSplit[0]
+            val v = flowSplit[1]
+
+            val mag = Mat()
+            Core.cartToPolar(u, v, mag, Mat(), false)
+            Imgproc.GaussianBlur(mag, mag, Size(5.0, 5.0), 0.0) // Matches apply_light_blur_safe
+
+            val avgMagnitude = Core.mean(mag).`val`[0]
+            val loomingScore = calculateLoomingScoreFast(u, v)
+            val (direction, _, _, _) = calculateDirection(mag)
+
+            // Smooth magnitude (exponential moving average)
+            smoothMag = ALPHA_SMOOTH * avgMagnitude + (1 - ALPHA_SMOOTH) * smoothMag
+
+            // Temporal integrator (accumulates slow motion)
+            if (!detectedState) {
+                temporalIntegrator = ALPHA_INTEGRATE * temporalIntegrator + avgMagnitude
+            } else {
+                temporalIntegrator = max(0.0, temporalIntegrator * 0.95) // Decay faster
+            }
+
+            // Update baseline (ONLY when NOT detected)
+            if (!detectedState) {
+                baselineSamples.addLast(smoothMag)
+                if (baselineSamples.size > 30) baselineSamples.removeFirst()
+            }
+
+            val baseline = if (baselineSamples.size >= 10) baselineSamples.sorted()[baselineSamples.size / 2] else null
+
+            // Adaptive threshold with clamp
+            val thresholdHigh = baseline?.let { min(max(it * 1.4, THRESHOLD_HIGH * 0.6), THRESHOLD_HIGH * 1.5) } ?: THRESHOLD_HIGH
+            val thresholdLow = baseline?.let { min(max(it * 1.0, THRESHOLD_LOW * 0.6), THRESHOLD_LOW * 1.5) } ?: THRESHOLD_LOW
+
+            val prevState = detectedState
+
+            // ENHANCED DETECTION LOGIC - Multi-metric OR logic (Matches Python)
+            val magDetected = (smoothMag > thresholdHigh && smoothMag > MIN_MAGNITUDE)
+            val intDetected = (temporalIntegrator > INTEGRATION_THRESHOLD)
+            val loomDetected = (loomingScore > LOOMING_THRESHOLD)
+
+            detectionMode = "NONE"
+            if (magDetected || intDetected || loomDetected) {
+                detectedState = true
+                detectionMode = when {
+                    magDetected -> "MAG"
+                    intDetected -> "INT"
+                    else -> "LOOM"
+                }
+            } else if (smoothMag < thresholdLow && temporalIntegrator < INTEGRATION_THRESHOLD * 0.5) {
+                detectedState = false
+            }
+
+            val stableDirection = if (detectedState) {
+                directionHistory.addLast(direction)
+                if (directionHistory.size > 5) directionHistory.removeFirst()
+                directionHistory.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key ?: "depan"
+            } else {
+                directionHistory.clear()
+                "depan"
+            }
+
+            val currentTime = System.currentTimeMillis()
+            if (detectedState && (!prevState || currentTime - lastAlertTime > COOLDOWN_MS)) {
+                runOnUiThread {
+                    alertText.text = getString(R.string.halangan_detected, stableDirection)
+                    alertText.visibility = View.VISIBLE
+                }
+                lastAlertTime = currentTime
+            } else if (!detectedState) {
+                runOnUiThread { alertText.visibility = View.GONE }
+            }
+
+            // --- Drawing is done on the full-size, original RGBA frame ---
+            drawOverlay(rgba, smoothMag, temporalIntegrator, loomingScore, detectedState, stableDirection)
+            updateTextUI(smoothMag, temporalIntegrator, loomingScore, stableDirection)
+
+            // Release all intermediate mats
+            flow.release()
+            mag.release()
+            flowSplit.forEach { if (!it.empty()) it.release() } // Releases u and v
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during frame processing: ${e.message}")
+        } finally {
+            // Update prevGray for the next frame
+            prevGray?.release()
+            prevGray = smallGray.clone()
+            smallGray.release()
+        }
+
+        return rgba // Return the original frame, now with the overlay
+    }
+
+    private fun precomputeRadialGrid(size: Size) {
+        val w = size.width.toInt()
+        val h = size.height.toInt()
+        val cx = w / 2.0
+        val cy = h / 2.0
+
+        radialX?.release(); radialY?.release()
+
+        val xs = Mat(h, w, CvType.CV_32F)
+        val ys = Mat(h, w, CvType.CV_32F)
+        val tmp = FloatArray(1)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                tmp[0] = (x - cx).toFloat()
+                xs.put(y, x, tmp)
+                tmp[0] = (y - cy).toFloat()
+                ys.put(y, x, tmp)
+            }
+        }
+
+        val rmag = Mat()
+        Core.magnitude(xs, ys, rmag)
+        Core.add(rmag, Scalar(1e-6), rmag)
+        radialX = Mat()
+        radialY = Mat()
+        Core.divide(xs, rmag, radialX)
+        Core.divide(ys, rmag, radialY)
+
+        xs.release(); ys.release(); rmag.release()
+    }
+
+    private fun calculateDirection(mag: Mat): Quad<String, Double, Double, Double> {
+        val w = mag.cols()
+        val h = mag.rows()
+        val wLeft = (w * 0.3).toInt()
+        val wRight = (w * 0.7).toInt()
+
+        val left = Core.mean(mag.submat(0, h, 0, wLeft)).`val`[0]
+        val center = Core.mean(mag.submat(0, h, wLeft, wRight)).`val`[0]
+        val right = Core.mean(mag.submat(0, h, wRight, w)).`val`[0]
+
+        val maxMag = max(max(left, center), right)
+        val dir = when {
+            center >= maxMag * 0.9 -> "depan"
+            left > right * (1 + DIRECTION_MARGIN) -> "kiri"
+            right > left * (1 + DIRECTION_MARGIN) -> "kanan"
+            else -> "depan"
+        }
+        return Quad(dir, left, center, right)
+    }
+
+    private fun calculateLoomingScoreFast(u: Mat, v: Mat): Double {
+        if (radialX == null || radialY == null) return 0.0
+        val projX = Mat(); val projY = Mat(); val proj = Mat()
+        Core.multiply(u, radialX, projX)
+        Core.multiply(v, radialY, projY)
+        Core.add(projX, projY, proj)
+        Core.max(proj, Scalar(0.0), proj)
+        val mean = Core.mean(proj).`val`[0]
+        proj.release(); projX.release(); projY.release()
+        return mean
+    }
+
+    private fun drawOverlay(
+        frame: Mat, smoothMag: Double, integrator: Double,
+        looming: Double, detected: Boolean, direction: String
+    ) {
+        val color = if (detected) Scalar(0.0, 0.0, 255.0, 255.0) else Scalar(0.0, 255.0, 0.0, 255.0)
+        Imgproc.putText(
+            frame,
+            "Mag %.2f Int %.1f Loom %.3f Dir %s".format(smoothMag, integrator, looming, direction),
+            Point(10.0, 20.0), Imgproc.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
+        )
+    }
+
+    private fun updateTextUI(mag: Double, integrator: Double, loom: Double, dir: String) {
+        runOnUiThread {
+            val status = if (detectedState) getString(R.string.status_detected, detectionMode) else getString(R.string.status_clear)
+            val magS = "%.2f".format(mag)
+            val intS = "%.1f".format(integrator)
+            val loomS = "%.3f".format(loom)
+            statusText.text = status
+            metricsText.text = getString(R.string.metrics_template, frameCount, magS, intS, loomS, dir)
+        }
+    }
+
+    data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+}

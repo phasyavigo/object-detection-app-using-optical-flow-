@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OptFlow</string>
+
+    <!-- Status -->
+    <string name="status_clear">🟢 CLEAR</string>
+    <string name="status_detected">🔴 DETECTED (%1$s)</string>
+
+    <!-- Alerts -->
+    <string name="halangan_detected">Halangan di %1$s!</string>
+
+    <!-- Metrics: placeholders: frame, magStr, intStr, loomStr, dir -->
+    <string name="metrics_template">Frame: %1$d\nMag: %2$s\nInt: %3$s\nLoom: %4$s\nDir: %5$s</string>
+</resources>

@@ -301,7 +301,8 @@ This project is open source and available for educational purposes.
 
 ## 👥 Authors
 
-- **Phasya Vigo** - *Initial work* - [@phasyavigo](https://github.com/phasyavigo)
+- **Phasya Vigo**
+- **Muhammmad Rafie Habibie**
 
 ## 🙏 Acknowledgments
 
